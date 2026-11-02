@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# pcb-render BOARD.kicad_pcb [render.py options...]
+# Exports GLB + pad data from KiCad (cached until the board changes), then renders in Blender.
+# Example: ./pcb-render ~/kicad/myboard/myboard.kicad_pcb --preset hero --side F
+#          ./pcb-render board.kicad_pcb --set standard     (shot set + contact sheet, one Blender session)
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+pcb="$(readlink -f "$1")"; shift
+name="$(basename "$pcb" .kicad_pcb)"
+work="$here/out/$name"
+mkdir -p "$work"
+glb="$work/$name.glb"; pads="$work/pads.json"
+
+# ---- export (shared cache): one exporter at a time, files appear atomically --------------------
+# Several renders may run at once (KiCad button, batch sets, other sessions). The lock serialises
+# exports; each export writes a temp file and renames it into place, so a reader never sees a
+# half-written GLB / pads.json (an already-open file stays readable even if it is replaced).
+exec 9>"$work/.export.lock"
+flock 9
+# Re-export when the board changed OR any referenced 3D model is newer than the cached GLB
+# (scripts/model_deps.py resolves ${KIPRJMOD}, ${KICADn_3DMODEL_DIR}, user path vars, .wrl->STEP).
+# the export "recipe" (options + model path mapping); a change in it invalidates the cache too
+glb_opts=(--subst-models --include-tracks --include-pads --include-zones --include-silkscreen --include-soldermask)
+recipe="$(printf '%s\n' "${glb_opts[@]}" "models-resolved-v1" | sha1sum | cut -c1-12)"
+why=""
+if [[ ! -s "$glb" ]]; then why="no cached GLB"
+elif [[ "$(cat "$work/.export.recipe" 2>/dev/null)" != "$recipe" ]]; then why="export settings changed"
+elif [[ "$pcb" -nt "$glb" ]]; then why="board changed"
+elif m="$(python3 "$here/scripts/model_deps.py" "$pcb" --newer "$glb")"; then why="3D model changed: $m"
+fi
+if [[ -n "$why" ]]; then
+  echo "exporting GLB ($why)..."
+  tmp="$work/.tmp-$$-$name.glb"
+  # export from a copy with every 3D model path resolved (older boards use ${KICAD6_3DMODEL_DIR}...,
+  # which KiCad 10 no longer expands; Mac paths, project-relative paths). The board itself is untouched.
+  # (same file name in a private dir: KiCad names the board's layer meshes after the file)
+  srcdir="$work/.src-$$"; mkdir -p "$srcdir"; src="$srcdir/$name.kicad_pcb"
+  python3 "$here/scripts/model_deps.py" "$pcb" --rewrite "$src"
+  kicad-cli pcb export glb -f "${glb_opts[@]}" -o "$tmp" "$src" >/dev/null
+  rm -rf "$srcdir"
+  mv -f "$tmp" "$glb"
+  echo "$recipe" > "$work/.export.recipe.$$" && mv -f "$work/.export.recipe.$$" "$work/.export.recipe"
+fi
+if [[ ! -s "$pads" || "$pcb" -nt "$pads" ]]; then
+  echo "extracting pads..."
+  tmp="$work/.tmp-$$-pads.json"
+  python3 "$here/scripts/extract_pads.py" "$pcb" "$tmp" 2>&1 | grep -v 'assert "m_choices'
+  mv -f "$tmp" "$pads"
+fi
+flock -u 9
+
+# ---- Blender: studio HDRI, build, colour management --------------------------------------------
+# Studio HDRI (Poly Haven, CC0): fetched on first use, not kept in git
+hdri_dir="$here/assets/hdri"
+for n in studio_small_09; do
+  if [[ ! -s "$hdri_dir/${n}_2k.exr" ]]; then
+    mkdir -p "$hdri_dir"
+    curl -fsSL -o "$hdri_dir/${n}_2k.exr.part" "https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/2k/${n}_2k.exr" \
+      && mv -f "$hdri_dir/${n}_2k.exr.part" "$hdri_dir/${n}_2k.exr" \
+      || echo "warning: could not fetch HDRI $n (falls back to Blender's studio.exr)"
+  fi
+done
+
+# Fedora's blender 5.2.2 ships an OCIO 2.5 config but links OCIO 2.4, which silently drops AgX.
+# Patch a private copy (strip 2.5-only keys); the official blender.org build doesn't need this.
+official="$HOME/.local/opt/blender-5.2.2-linux-x64/blender"
+if [[ -n "${BLENDER:-}" ]]; then blender="$BLENDER"
+elif [[ -x "$official" ]]; then blender="$official"   # official build: own OCIO, AgX works
+else blender=blender; fi
+sys_ocio=/usr/share/blender/5.2/datafiles/colormanagement
+ocio_env=()
+if [[ "$blender" == blender && -f "$sys_ocio/config.ocio" ]] && grep -q '^ocio_profile_version: 2.5' "$sys_ocio/config.ocio"; then
+  if [[ ! -f "$here/ocio/config.ocio" || "$sys_ocio/config.ocio" -nt "$here/ocio/config.ocio" ]]; then
+    rm -rf "$here/ocio" && cp -r "$sys_ocio" "$here/ocio"
+    sed -i 's/^ocio_profile_version: 2.5/ocio_profile_version: 2.4/; /^    interop_id:/d; /^    interchange:/{N;d}' \
+      "$here/ocio/config.ocio"
+  fi
+  ocio_env=(OCIO="$here/ocio/config.ocio")
+fi
+
+run_blender() {
+  env "${ocio_env[@]}" "$blender" -b --factory-startup -P "$here/scripts/render.py" -- --glb "$glb" --pads "$pads" "$@" \
+    2>&1 | grep --line-buffered -E '^\[pcb-render|Error|Traceback|^  File|Exception|Fra:.*Sample [0-9]+/[0-9]+$' \
+    | awk '/Sample/ { if (++n % 20) next } { print; fflush() }'
+}
+
+# ---- --set NAME: all shots in ONE Blender session, then a contact sheet ------------------------
+# scripts/shots.py picks the shots from the board; the import, materials, relief map and solder
+# are built once. Other options (samples, res, device, imperfection...) apply to every shot.
+setname="" rest=()
+while (($#)); do
+  if [[ "$1" == "--set" ]]; then setname="$2"; shift 2; else rest+=("$1"); shift; fi
+done
+set -- "${rest[@]+"${rest[@]}"}"
+if [[ -n "$setname" ]]; then
+  shotfile="$work/.shots-$$.json"
+  trap 'rm -f "$shotfile"' EXIT
+  python3 "$here/scripts/shots.py" "$pads" "$setname" --json "$work" "$name" > "$shotfile"
+  mapfile -t outs < <(python3 -c 'import json,sys; [print(s["out"]) for s in json.load(open(sys.argv[1]))]' "$shotfile")
+  start=$(date +%s)
+  run_blender --shots "$shotfile" "$@"
+  margs=()
+  for f in "${outs[@]}"; do
+    if [[ -s "$f" && $(stat -c %Y "$f") -ge $start ]]; then
+      lbl="$(basename "$f" .png)"; lbl="${lbl#"${name}"_}"
+      margs+=(-label "$lbl" "$f")
+    else
+      echo "warning: shot missing: $f"
+    fi
+  done
+  sheet="$work/${name}_sheet_${setname}.png"
+  montage -background '#1c1c1e' -fill '#d8d8d8' -pointsize 26 -geometry 960x600+10+10 -tile 3x \
+    "${margs[@]}" -title "$name" "$sheet"
+  echo "$sheet"
+  exit 0
+fi
+
+# ---- single shot -------------------------------------------------------------------------------
+# default output name from preset/side unless --out given
+out=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do [[ "${args[i]}" == "--out" ]] && out="${args[i+1]}"; done
+if [[ -z "$out" ]]; then
+  preset=hero side=F
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    [[ "${args[i]}" == "--preset" ]] && preset="${args[i+1]}"
+    [[ "${args[i]}" == "--side" ]] && side="${args[i+1]}"
+    [[ "${args[i]}" == "--focus" ]] && preset="$preset-${args[i+1]}"
+    [[ "${args[i]}" == "--viewport" ]] && preset="vp-${args[i+1]}"
+  done
+  out="$work/${name}_${preset}_${side}.png"
+  args+=(--out "$out")
+fi
+run_blender "${args[@]}"
+echo "$out"

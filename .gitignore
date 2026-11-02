@@ -1,0 +1,6 @@
+out/
+ocio/
+__pycache__/
+*.blend
+*.blend1
+assets/hdri/
